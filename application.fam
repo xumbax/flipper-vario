@@ -8,7 +8,7 @@ App(
     fap_icon="vario_icon.png",
     fap_category="GPIO",
     fap_description="Variometer for paragliding and hiking using BME280 pressure sensor",
-    fap_author="your_github_username",
+    fap_author="xumbax",
     fap_weburl="https://github.com/xumbax/flipper-vario",
     fap_version=(1, 0),
     fap_icon_assets="images",
