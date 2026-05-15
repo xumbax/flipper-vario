@@ -2,29 +2,18 @@
  * @file vario_app.c
  * @brief Вариометр для Flipper Zero на базе датчика BME280.
  *
- * Архитектура приложения:
- *   ┌─────────────────────────────────────────────────┐
- *   │  Главный поток (vario_app)                      │
- *   │  • Цикл событий GUI (furi_message_queue_get)    │
- *   │  • Обработка кнопок                             │
- *   │  • Управление подсветкой                        │
- *   └──────────────────┬──────────────────────────────┘
- *                      │ FuriMutex (защита VarioData)
- *   ┌──────────────────┴──────────────────────────────┐
- *   │  Рабочий поток (vario_worker)                   │
- *   │  • Чтение BME280 каждые 200 мс                  │
- *   │  • Фильтр Калмана → высота и вертикальная скорость│
- *   │  • Звуковая индикация (неблокирующая)           │
- *   │  • Запись CSV лога на SD карту                  │
- *   └─────────────────────────────────────────────────┘
+ * Layout экрана 128×64:
  *
- * Кнопки:
- *   Вверх  — вкл/выкл звук
- *   Вниз   — вкл/выкл принудительную подсветку
- *   OK     — открыть меню настроек
- *   Назад  — закрыть меню / выйти из приложения
+ *   x=0..13   y=0..63  — VBAR: полоса вертикальной скорости
+ *   x=14..127 y=0..15  — Высота (FontBigNumbers) + "m"
+ *   x=14..127 y=18..49 — График мин/макс скорости за 2с (114px = ~228с истории)
+ *   x=14..127 y=50..56 — Вертикальная скорость (FontSecondary)
+ *   x=14..127 y=57..63 — Температура + давление (FontSecondary)
  *
- * Лог: /ext/vario_log_YYYYMMDD.csv
+ * Меню (3 пункта):
+ *   [0] Sound      — вкл/выкл звук
+ *   [1] Backlight  — принудительная подсветка
+ *   [2] Correct Alt.— Up/Down ±10м, OK применить, < отмена, > обнуление
  */
 
 #include <furi.h>
@@ -45,54 +34,79 @@
 #define TAG "Vario"
 
 /* ── Фильтр Калмана ───────────────────────────────────────────────────── */
-#define KF_VAR_MEASUREMENT 0.1f   /* Дисперсия шума измерений (Па²)      */
-#define KF_VAR_ACCEL       0.75f  /* Дисперсия ускорения (Па²/с⁴)        */
+#define KF_VAR_MEASUREMENT 0.1f
+#define KF_VAR_ACCEL       0.75f
 #define SEA_LEVEL_PRESSURE 101325.0f
 
-/* ── Пороги звуковой сигнализации ────────────────────────────────────── */
-#define VARIO_CLIMB_THRESHOLD  0.3f   /* м/с — начало сигнала подъёма    */
-#define VARIO_SINK_THRESHOLD  -0.9f   /* м/с — начало сигнала снижения   */
+/* ── Звук ─────────────────────────────────────────────────────────────── */
+#define VARIO_CLIMB_THRESHOLD  0.3f
+#define VARIO_SINK_THRESHOLD  -0.9f
 
-/* ── Индикатор вертикальной скорости (полоса слева) ──────────────────── */
-#define VBAR_X       4     /* X левого края полосы                        */
-#define VBAR_W       6     /* Ширина полосы (пикселей)                    */
-#define VBAR_CY     32     /* Y центра полосы (нейтраль)                  */
-#define VBAR_HALF   26     /* Полувысота шкалы (пикселей)                 */
-#define VBAR_MAX_MS  5.0f  /* Скорость при полном отклонении (м/с)        */
+/* ── Полоса вертикальной скорости (VBAR) ─────────────────────────────── */
+#define VBAR_X      4
+#define VBAR_W      6
+#define VBAR_CY    32    /* центр по Y */
+#define VBAR_HALF  26    /* полувысота шкалы в пикселях */
+#define VBAR_MAX_MS 5.0f /* скорость при полном отклонении */
 
-/* ── Меню настроек ────────────────────────────────────────────────────── */
+/* ── График скоростей ─────────────────────────────────────────────────── */
 /*
- * Экран Flipper: 128×64 px.
- * Заголовок "Settings" (FontPrimary ~12px) + разделитель занимают до y=14.
- * Доступно для 4 пунктов: y=15..63 = 48px.
+ * Область: x=14..127 (113px), y=18..49 (32px), центр y=33.
+ * Каждый столбец = одна 2-секундная выборка.
+ * Новые данные появляются СЛЕВА, старые уходят ВПРАВО.
+ * Буфер 114 элементов — история ~228 секунд.
  *
- * FontSecondary: высота глифа ~8px, координата Y = baseline (нижний край).
- * Шаг строк STEP=12px: текст 8px + 4px зазор.
- * Рамка: 1px выше верхнего края глифа, 1px ниже baseline → высота 10px.
- *
- * MENU_FIRST_Y=25  — baseline первой строки
- * MENU_ROW_STEP=12 — шаг между строками
- *
- * Проверка (baseline / frame_top / frame_bottom):
- *   [0]: 25 / 16 / 25  ✓
- *   [1]: 37 / 28 / 37  ✓
- *   [2]: 49 / 40 / 49  ✓
- *   [3]: 61 / 52 / 61  ✓  (61 < 64 — в пределах экрана)
+ * Таблица |скорость| → смещение от центра в пикселях:
+ *   <0.5 м/с   → 0 (середина)
+ *   0.5..0.99  → 1
+ *   1.0..1.99  → 2
+ *   2.0..4.99  → 3
+ *   5.0..10.0  → 4
+ *   >10.0      → 5
  */
-#define MENU_FONT_H    8   /* Высота FontSecondary (пикселей)             */
-#define MENU_ROW_STEP 12   /* Шаг между строками меню (пикселей)          */
-#define MENU_FIRST_Y  25   /* Baseline первой строки меню                 */
-#define MENU_FRAME_H  (MENU_FONT_H + 2)             /* Высота рамки       */
+#define GRAPH_X    15    /* x начала графика (на 1px правее VBAR) */
+#define GRAPH_W   113    /* ширина в пикселях = 128 - GRAPH_X */
+#define GRAPH_CY   33    /* центральная линия графика по Y */
+#define GRAPH_TOP  18    /* верхняя граница области графика */
+#define GRAPH_BOT  49    /* нижняя граница области графика */
+#define GRAPH_INTERVAL_MS 2000u /* интервал накопления одной точки */
+
+/* ── Лог ──────────────────────────────────────────────────────────────── */
+#define LOG_FILE        "/ext/VarioLog.csv"
+#define LOG_INTERVAL_MS 30000u  /* 30 секунд */
+
+/* ── Меню ─────────────────────────────────────────────────────────────── */
+/*
+ * 3 пункта (индексы 0..2).
+ * Экран: заголовок до y=13, доступно y=14..63 = 50px.
+ * FontSecondary: высота 8px, baseline = нижний край.
+ * FIRST_Y=27, STEP=14 → пункт 2: baseline=55, frame_bot=56 ✓
+ *
+ * Пункт 2 (коррекция высоты) имеет особый режим редактирования:
+ * при нажатии OK переходим в режим menu_editing=true,
+ * Up/Down меняют alt_correction ±10м, OK применяет и выходит из режима.
+ */
+#define MENU_FONT_H    8
+#define MENU_ROW_STEP 14
+#define MENU_FIRST_Y  27
+#define MENU_FRAME_H  (MENU_FONT_H + 2)
+#define MENU_COUNT     3
 #define MENU_ROW_Y(i)     (MENU_FIRST_Y + (i) * MENU_ROW_STEP)
 #define MENU_FRAME_TOP(i) (MENU_ROW_Y(i) - MENU_FONT_H - 1)
 
-/* ── Настройки приложения ─────────────────────────────────────────────── */
+/* ── Настройки ────────────────────────────────────────────────────────── */
 typedef struct {
-    bool     sound_enabled;
-    bool     backlight_forced;
-    bool     logging_enabled;
-    uint32_t log_interval; /* секунд */
+    bool  sound_enabled;
+    bool  backlight_forced;
+    float alt_correction; /* поправка высоты в метрах */
 } VarioSettings;
+
+/* ── Данные одной точки графика ───────────────────────────────────────── */
+typedef struct {
+    int8_t min_px; /* смещение min скорости от центра (отриц. = вниз) */
+    int8_t max_px; /* смещение max скорости от центра (полож. = вверх) */
+    bool   valid;  /* true если данные есть */
+} GraphPoint;
 
 /* ── Состояние приложения ─────────────────────────────────────────────── */
 typedef struct {
@@ -107,7 +121,7 @@ typedef struct {
     /* Данные датчика */
     float pressure;
     float temperature;
-    float altitude;
+    float altitude;     /* сырая высота из барометра */
     float vario;
     float varioS;
 
@@ -115,12 +129,26 @@ typedef struct {
     bool    sensor_ready;
     BME280* bme280;
 
-    /* UI */
+    /* Настройки и UI */
     VarioSettings settings;
-    uint32_t last_log_time;
+    bool          show_menu;
+    uint8_t       menu_selection;  /* 0..2 */
+    bool          menu_editing;    /* режим редактирования alt_correction */
+    float         alt_edit_value;  /* временное значение при редактировании */
+
+    /* Подсветка */
     uint32_t last_button_time;
-    bool     show_menu;
-    uint8_t  menu_selection;
+
+    /* Лог */
+    uint32_t last_log_ms;      /* тик последней записи */
+    uint32_t app_start_ms;     /* тик запуска приложения */
+
+    /* График */
+    GraphPoint graph[GRAPH_W]; /* [0]=самый новый (левый), [W-1]=старый (правый) */
+    uint32_t   graph_last_ms;  /* тик последнего сбора точки */
+    float      graph_vmin;     /* минимум за текущий 2с интервал */
+    float      graph_vmax;     /* максимум за текущий 2с интервал */
+    bool       graph_has_data; /* есть ли данные в текущем интервале */
 
     /* Синхронизация */
     FuriMutex*    mutex;
@@ -130,19 +158,33 @@ typedef struct {
 static VarioData*       vario_data   = NULL;
 static NotificationApp* notification = NULL;
 
-/* ── Вспомогательные функции ──────────────────────────────────────────── */
+/* ── Вспомогательное ──────────────────────────────────────────────────── */
 
 static float pressure2altitude(float pressure) {
     return 44330.0f * (1.0f - powf(pressure / SEA_LEVEL_PRESSURE, 0.190295f));
 }
 
-static void kf_reset(float abs_value, float vel_value) {
-    vario_data->kf_x_abs     = abs_value;
-    vario_data->kf_x_vel     = vel_value;
+static void kf_reset(float abs_val, float vel_val) {
+    vario_data->kf_x_abs     = abs_val;
+    vario_data->kf_x_vel     = vel_val;
     vario_data->kf_p_abs_abs = 1.0e9f;
     vario_data->kf_p_abs_vel = 0.0f;
     vario_data->kf_p_vel_vel = KF_VAR_ACCEL;
     vario_data->kf_var_accel = KF_VAR_ACCEL;
+}
+
+/**
+ * Переводит абсолютное значение скорости (м/с) в смещение пикселей от
+ * центральной линии графика согласно таблице из ТЗ.
+ */
+static int speed_to_px(float v) {
+    float av = fabsf(v);
+    if(av < 0.5f)  return 0;
+    if(av < 1.0f)  return 1;
+    if(av < 2.0f)  return 2;
+    if(av < 5.0f)  return 3;
+    if(av <= 10.0f) return 4;
+    return 5;
 }
 
 /* ── Инициализация датчика ────────────────────────────────────────────── */
@@ -178,44 +220,50 @@ static bool bme280_init_sensor(void) {
     return true;
 }
 
-/* ── Логирование ──────────────────────────────────────────────────────── */
+/* ── Лог ──────────────────────────────────────────────────────────────── */
 
+/**
+ * Инициализация лога при старте приложения:
+ * очищает файл если существует, создаёт заново.
+ */
+static void log_init(void) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    /* Удаляем старый файл — storage_simply_remove не вернёт ошибку
+     * если файла нет, это нормально. */
+    storage_simply_remove(storage, LOG_FILE);
+    furi_record_close(RECORD_STORAGE);
+    vario_data->last_log_ms  = furi_get_tick();
+    vario_data->app_start_ms = furi_get_tick();
+}
+
+/**
+ * Записывает строку в лог каждые 30 секунд.
+ * Формат: время работы (сек); высота (м)
+ */
 static void log_to_file(void) {
-    if(!vario_data->settings.logging_enabled) return;
     uint32_t now = furi_get_tick();
-    if(now - vario_data->last_log_time < vario_data->settings.log_interval * 1000u) return;
+    if(now - vario_data->last_log_ms < LOG_INTERVAL_MS) return;
 
     furi_mutex_acquire(vario_data->mutex, FuriWaitForever);
-    float alt    = vario_data->altitude;
-    float varioS = vario_data->varioS;
-    float temp   = vario_data->temperature;
-    float press  = vario_data->pressure;
+    float alt = vario_data->altitude + vario_data->settings.alt_correction;
     furi_mutex_release(vario_data->mutex);
+
+    uint32_t elapsed_sec = (now - vario_data->app_start_ms) / 1000u;
 
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File*    file    = storage_file_alloc(storage);
-    DateTime dt;
-    furi_hal_rtc_get_datetime(&dt);
 
-    char filename[64];
-    snprintf(filename, sizeof(filename), "/ext/vario_log_%04d%02d%02d.csv",
-             dt.year, dt.month, dt.day);
-
-    if(storage_file_open(file, filename, FSAM_WRITE, FSOM_OPEN_APPEND)) {
-        if(storage_file_size(file) == 0) {
-            const char* hdr = "Time,Altitude_m,VarioS_ms,Temperature_C,Pressure_Pa\n";
-            storage_file_write(file, hdr, strlen(hdr));
-        }
-        char line[128];
-        snprintf(line, sizeof(line), "%02d:%02d:%02d,%.2f,%.2f,%.1f,%.0f\n",
-                 dt.hour, dt.minute, dt.second,
-                 (double)alt, (double)(varioS * 0.01f), (double)temp, (double)press);
+    if(storage_file_open(file, LOG_FILE, FSAM_WRITE, FSOM_OPEN_APPEND)) {
+        char line[64];
+        snprintf(line, sizeof(line), "%lu;%.1f\n",
+                 (unsigned long)elapsed_sec, (double)alt);
         storage_file_write(file, line, strlen(line));
         storage_file_close(file);
     }
+
     storage_file_free(file);
     furi_record_close(RECORD_STORAGE);
-    vario_data->last_log_time = now;
+    vario_data->last_log_ms = now;
 }
 
 /* ── Фильтр Калмана ───────────────────────────────────────────────────── */
@@ -240,7 +288,7 @@ static void update_pressure(void) {
 
     /* Predict */
     vario_data->kf_x_abs += vario_data->kf_x_vel * dt;
-    float dt2 = dt * dt, dt3 = dt2 * dt, dt4 = dt3 * dt;
+    float dt2 = dt*dt, dt3 = dt2*dt, dt4 = dt3*dt;
     vario_data->kf_p_abs_abs += 2.0f*dt*vario_data->kf_p_abs_vel
                               + dt2*vario_data->kf_p_vel_vel
                               + vario_data->kf_var_accel*dt4/4.0f;
@@ -261,42 +309,72 @@ static void update_pressure(void) {
 
     float altitude = pressure2altitude(vario_data->kf_x_abs);
     vario_data->altitude = altitude;
-    vario_data->vario    = (altitude -
+    vario_data->vario  = (altitude -
         pressure2altitude(vario_data->kf_x_abs - vario_data->kf_x_vel)) * 100.0f;
-    vario_data->varioS   = 0.7f * vario_data->varioS + 0.3f * vario_data->vario;
+    vario_data->varioS = 0.7f * vario_data->varioS + 0.3f * vario_data->vario;
+
+    /* Обновляем мин/макс для текущего интервала графика */
+    float vs = vario_data->varioS * 0.01f; /* см/с → м/с */
+    if(!vario_data->graph_has_data) {
+        vario_data->graph_vmin = vs;
+        vario_data->graph_vmax = vs;
+        vario_data->graph_has_data = true;
+    } else {
+        if(vs < vario_data->graph_vmin) vario_data->graph_vmin = vs;
+        if(vs > vario_data->graph_vmax) vario_data->graph_vmax = vs;
+    }
 
     furi_mutex_release(vario_data->mutex);
 }
 
-/* ── Звуковая индикация ───────────────────────────────────────────────── */
-
-/*
- * ИСПРАВЛЕНО — два критических бага:
- *
- * БАГ 1 (звук не останавливается / MUTE не работает):
- *   Предыдущая версия делала acquire→start, но НЕ делала release после start.
- *   Это означало что динамик оставался захваченным нами навсегда.
- *   При следующей попытке stop: acquire(0) возвращал false (мы сами держим),
- *   поэтому stop никогда не вызывался.
- *
- *   Правильная модель владения Flipper speaker:
- *     acquire → start → ... → stop → release   (всё в одной сессии)
- *   Для неблокирующего звука мы ДЕРЖИМ speaker между start и stop,
- *   используя статический флаг speaker_owned.
- *
- * БАГ 2 (звук не останавливается после выхода):
- *   При выходе speaker мог быть захвачен нами (speaker_owned=true).
- *   Теперь sound_stop() вызывается явно при завершении воркера.
+/**
+ * Раз в GRAPH_INTERVAL_MS сохраняет точку в буфер графика.
+ * Сдвигает буфер: [0] — всегда самый новый элемент.
+ * При отрисовке элемент [0] рисуется на x=GRAPH_X (левый край).
  */
+static void graph_update(void) {
+    uint32_t now = furi_get_tick();
+    if(now - vario_data->graph_last_ms < GRAPH_INTERVAL_MS) return;
+    vario_data->graph_last_ms = now;
 
-/* Статические переменные состояния звука.
- * static внутри функции — живут всё время работы воркера. */
-static bool     sound_speaker_owned = false; /* мы держим speaker сейчас */
-static uint32_t sound_next_beep     = 0;     /* тик начала следующего бипа */
-static uint32_t sound_beep_end      = 0;     /* тик конца текущего бипа */
+    furi_mutex_acquire(vario_data->mutex, FuriWaitForever);
 
-/* Безусловно останавливает динамик и освобождает его.
- * Вызывать при выключении звука и при завершении приложения. */
+    /* Сдвигаем буфер вправо (старые данные → конец) */
+    memmove(&vario_data->graph[1], &vario_data->graph[0],
+            sizeof(GraphPoint) * (GRAPH_W - 1));
+
+    GraphPoint pt;
+    if(vario_data->graph_has_data) {
+        float vmin = vario_data->graph_vmin;
+        float vmax = vario_data->graph_vmax;
+        int px_min = speed_to_px(vmin);
+        int px_max = speed_to_px(vmax);
+
+        /* Знак определяет направление от центра:
+         * положительная скорость → вверх (отрицательный Y на экране)
+         * отрицательная скорость → вниз (положительный Y на экране) */
+        pt.min_px = (int8_t)(vmin >= 0.0f ? px_min : -px_min);
+        pt.max_px = (int8_t)(vmax >= 0.0f ? px_max : -px_max);
+        pt.valid  = true;
+    } else {
+        pt.min_px = 0;
+        pt.max_px = 0;
+        pt.valid  = false;
+    }
+    vario_data->graph[0] = pt;
+
+    /* Сбрасываем аккумулятор для следующего интервала */
+    vario_data->graph_has_data = false;
+
+    furi_mutex_release(vario_data->mutex);
+}
+
+/* ── Звук ─────────────────────────────────────────────────────────────── */
+
+static bool     sound_speaker_owned = false;
+static uint32_t sound_next_beep     = 0;
+static uint32_t sound_beep_end      = 0;
+
 static void sound_stop(void) {
     if(sound_speaker_owned) {
         furi_hal_speaker_stop();
@@ -308,97 +386,81 @@ static void sound_stop(void) {
 }
 
 static void sound_update(void) {
-    /* Если звук выключен — немедленно глушим динамик если он наш */
     if(!vario_data || !vario_data->sensor_ready || !vario_data->settings.sound_enabled) {
         sound_stop();
         return;
     }
-
     uint32_t now = furi_get_tick();
 
-    /* Конец бипа — останавливаем звук, но НЕ освобождаем speaker немедленно.
-     * Освобождение происходит в sound_stop() или при следующем acquire. */
     if(sound_speaker_owned && sound_beep_end != 0 && now >= sound_beep_end) {
         furi_hal_speaker_stop();
         furi_hal_speaker_release();
         sound_speaker_owned = false;
         sound_beep_end      = 0;
     }
-
-    /* Ещё не время следующего бипа */
     if(now < sound_next_beep) return;
 
     furi_mutex_acquire(vario_data->mutex, FuriWaitForever);
-    float vspeed = vario_data->varioS * 0.01f; /* см/с → м/с */
+    float vspeed = vario_data->varioS * 0.01f;
     furi_mutex_release(vario_data->mutex);
 
     if(vspeed > VARIO_CLIMB_THRESHOLD) {
-        /* Подъём: короткий бип, частота растёт со скоростью */
         uint32_t beep_ms = (uint32_t)(350 - (int)(vspeed * 50.0f));
         if(beep_ms < 50u) beep_ms = 50u;
-        uint32_t gap_ms  = beep_ms / 4u;
-
         int freq = 1300 + (int)(vspeed * 100.0f);
         if(freq > 2300) freq = 2300;
-
-        sound_next_beep = now + beep_ms + gap_ms;
+        sound_next_beep = now + beep_ms + beep_ms / 4u;
         sound_beep_end  = now + beep_ms;
-
-        /* acquire с таймаутом 10мс — если система занята, пробуем чуть подождать */
         if(furi_hal_speaker_acquire(10)) {
             sound_speaker_owned = true;
             furi_hal_speaker_start((float)freq, 1.0f);
-            /* speaker остаётся захваченным до sound_beep_end */
         }
-
     } else if(vspeed < VARIO_SINK_THRESHOLD) {
-        /* Снижение: низкий тон, частота падает со скоростью */
         int bp = 350 + (int)(vspeed * 25.0f);
         if(bp < 50) bp = 50;
         uint32_t beep_ms = (uint32_t)bp;
-        uint32_t gap_ms  = beep_ms / 4u;
-
         int freq = 1000 + (int)(vspeed * 50.0f);
         if(freq < 300) freq = 300;
-
-        sound_next_beep = now + beep_ms + gap_ms;
+        sound_next_beep = now + beep_ms + beep_ms / 4u;
         sound_beep_end  = now + beep_ms;
-
         if(furi_hal_speaker_acquire(10)) {
             sound_speaker_owned = true;
             furi_hal_speaker_start((float)freq, 1.0f);
         }
-
     } else {
-        /* Нейтральная зона: тишина */
         sound_next_beep = now + 100u;
-        /* beep_end уже обнулён выше или равен 0 */
     }
 }
 
 /* ── Подсветка ────────────────────────────────────────────────────────── */
 
+/*
+ * ИСПРАВЛЕНО: принудительная подсветка теперь посылает нотификацию
+ * при каждом цикле пока active=true, а не только при смене состояния.
+ * Это нужно потому что Flipper гасит подсветку по своему таймеру,
+ * и нам нужно постоянно её переустанавливать.
+ * Интервал переустановки: 4000мс (чуть меньше чем системный таймаут ~5с).
+ */
 static void update_backlight(void) {
-    static bool last_state = false;
+    static uint32_t last_backlight_set = 0;
+    uint32_t now = furi_get_tick();
+
     bool active = vario_data->settings.backlight_forced ||
-                  (furi_get_tick() - vario_data->last_button_time < 5000u);
-    if(active != last_state) {
-        if(active) notification_message(notification, &sequence_display_backlight_on);
-        last_state = active;
+                  (now - vario_data->last_button_time < 5000u);
+
+    if(active) {
+        /* Переустанавливаем подсветку каждые 4 секунды пока active */
+        if(now - last_backlight_set >= 4000u) {
+            notification_message(notification, &sequence_display_backlight_on);
+            last_backlight_set = now;
+        }
     }
 }
 
-/* ── Индикатор вертикальной скорости ─────────────────────────────────── */
+/* ── Отрисовка VBAR ───────────────────────────────────────────────────── */
 
-/*
- * Вертикальная полоса слева экрана (VBAR_X, VBAR_W px).
- * Центр = нейтраль (VBAR_CY). Заливка и стрелка пропорциональны скорости.
- * Полная шкала: VBAR_MAX_MS м/с → VBAR_HALF пикселей.
- */
 static void draw_vbar(Canvas* canvas, float vspeed) {
     int cx = VBAR_X + VBAR_W / 2;
-
-    /* Рамка и центральная линия */
     canvas_draw_frame(canvas, VBAR_X, VBAR_CY - VBAR_HALF, VBAR_W, VBAR_HALF * 2);
     canvas_draw_line(canvas, VBAR_X, VBAR_CY, VBAR_X + VBAR_W - 1, VBAR_CY);
 
@@ -408,30 +470,65 @@ static void draw_vbar(Canvas* canvas, float vspeed) {
     int fill_px = (int)(clamped / VBAR_MAX_MS * (float)VBAR_HALF);
 
     if(fill_px > 1) {
-        /* Подъём: заливка вверх, стрелка вверху */
         int top = VBAR_CY - fill_px;
         for(int y = top; y < VBAR_CY; y++)
-            canvas_draw_line(canvas, VBAR_X + 1, y, VBAR_X + VBAR_W - 2, y);
-        /* Треугольник острием вверх */
-        for(int i = 0; i <= VBAR_W / 2; i++)
-            canvas_draw_line(canvas,
-                             cx - i, top - (VBAR_W / 2 - i),
-                             cx + i, top - (VBAR_W / 2 - i));
-
+            canvas_draw_line(canvas, VBAR_X+1, y, VBAR_X+VBAR_W-2, y);
+        for(int i = 0; i <= VBAR_W/2; i++)
+            canvas_draw_line(canvas, cx-i, top-(VBAR_W/2-i), cx+i, top-(VBAR_W/2-i));
     } else if(fill_px < -1) {
-        /* Снижение: заливка вниз, стрелка внизу */
         int bot = VBAR_CY - fill_px;
-        for(int y = VBAR_CY + 1; y <= bot; y++)
-            canvas_draw_line(canvas, VBAR_X + 1, y, VBAR_X + VBAR_W - 2, y);
-        /* Треугольник острием вниз */
-        for(int i = 0; i <= VBAR_W / 2; i++)
-            canvas_draw_line(canvas,
-                             cx - i, bot + (VBAR_W / 2 - i),
-                             cx + i, bot + (VBAR_W / 2 - i));
+        for(int y = VBAR_CY+1; y <= bot; y++)
+            canvas_draw_line(canvas, VBAR_X+1, y, VBAR_X+VBAR_W-2, y);
+        for(int i = 0; i <= VBAR_W/2; i++)
+            canvas_draw_line(canvas, cx-i, bot+(VBAR_W/2-i), cx+i, bot+(VBAR_W/2-i));
     }
 }
 
-/* ── Отрисовка ────────────────────────────────────────────────────────── */
+/* ── Отрисовка графика ────────────────────────────────────────────────── */
+
+/*
+ * Рисует график скоростей.
+ * Буфер graph[0..GRAPH_W-1]: [0]=новый (левый), [W-1]=старый (правый).
+ * Экранная координата: x = GRAPH_X + (GRAPH_W - 1 - i)
+ *   т.е. graph[0] рисуется на x = GRAPH_X + GRAPH_W - 1 = 127 — крайний правый.
+ *
+ * Нет! Условие: "каждые 2с появляются пиксели СЛЕВА, сдвигается вправо".
+ * Значит новые данные — слева. graph[0] → x=GRAPH_X (левый).
+ *   x = GRAPH_X + i
+ */
+static void draw_graph(Canvas* canvas) {
+    /* Центральная пунктирная линия */
+    for(int x = GRAPH_X; x <= GRAPH_X + GRAPH_W - 1; x += 3)
+        canvas_draw_dot(canvas, x, GRAPH_CY);
+
+    for(int i = 0; i < GRAPH_W; i++) {
+        GraphPoint* pt = &vario_data->graph[i];
+        if(!pt->valid) continue;
+
+        int x = GRAPH_X + i; /* [0]=левый, [W-1]=правый */
+
+        if(pt->min_px == 0 && pt->max_px == 0) {
+            /* Нейтраль — точка на центральной линии */
+            canvas_draw_dot(canvas, x, GRAPH_CY);
+        } else {
+            /* Минимум: min_px > 0 → вверх (y уменьшается), < 0 → вниз */
+            int y_min = GRAPH_CY - pt->min_px;
+            int y_max = GRAPH_CY - pt->max_px;
+
+            /* Ограничиваем в пределах области */
+            if(y_min < GRAPH_TOP) y_min = GRAPH_TOP;
+            if(y_min > GRAPH_BOT) y_min = GRAPH_BOT;
+            if(y_max < GRAPH_TOP) y_max = GRAPH_TOP;
+            if(y_max > GRAPH_BOT) y_max = GRAPH_BOT;
+
+            canvas_draw_dot(canvas, x, y_min);
+            if(y_max != y_min)
+                canvas_draw_dot(canvas, x, y_max);
+        }
+    }
+}
+
+/* ── Главный draw callback ────────────────────────────────────────────── */
 
 static void draw_callback(Canvas* canvas, void* ctx) {
     UNUSED(ctx);
@@ -444,19 +541,13 @@ static void draw_callback(Canvas* canvas, void* ctx) {
 
     furi_mutex_acquire(vario_data->mutex, FuriWaitForever);
 
-    /* ── Меню настроек ────────────────────────────────────────────────── */
+    /* ── Меню ─────────────────────────────────────────────────────────── */
     if(vario_data->show_menu) {
         canvas_set_font(canvas, FontPrimary);
         canvas_draw_str(canvas, 2, 11, "Settings");
         canvas_draw_line(canvas, 0, 13, 127, 13);
 
         canvas_set_font(canvas, FontSecondary);
-
-        /*
-         * Рамка на всю ширину экрана (0..127) — не прыгает при смене пункта.
-         * Координаты рассчитаны через макросы MENU_ROW_Y / MENU_FRAME_TOP.
-         * Значение ON/OFF выровнено по правому краю на x=90.
-         */
 
         /* Пункт 0: Sound */
         if(vario_data->menu_selection == 0)
@@ -472,20 +563,24 @@ static void draw_callback(Canvas* canvas, void* ctx) {
         canvas_draw_str(canvas, 90, MENU_ROW_Y(1),
                         vario_data->settings.backlight_forced ? "ON" : "OFF");
 
-        /* Пункт 2: Logging */
+        /* Пункт 2: Correct Alt. */
         if(vario_data->menu_selection == 2)
             canvas_draw_frame(canvas, 0, MENU_FRAME_TOP(2), 128, MENU_FRAME_H);
-        canvas_draw_str(canvas, 4, MENU_ROW_Y(2), "Logging:");
-        canvas_draw_str(canvas, 90, MENU_ROW_Y(2),
-                        vario_data->settings.logging_enabled ? "ON" : "OFF");
+        canvas_draw_str(canvas, 4, MENU_ROW_Y(2), "Correct Alt.:");
 
-        /* Пункт 3: Log interval */
-        if(vario_data->menu_selection == 3)
-            canvas_draw_frame(canvas, 0, MENU_FRAME_TOP(3), 128, MENU_FRAME_H);
-        canvas_draw_str(canvas, 4, MENU_ROW_Y(3), "Log interval:");
-        char ival[10];
-        snprintf(ival, sizeof(ival), "%us", (unsigned)vario_data->settings.log_interval);
-        canvas_draw_str(canvas, 100, MENU_ROW_Y(3), ival);
+        /* В режиме редактирования показываем временное значение */
+        float disp_corr = vario_data->menu_editing
+                          ? vario_data->alt_edit_value
+                          : vario_data->settings.alt_correction;
+        char cbuf[16];
+        snprintf(cbuf, sizeof(cbuf), "%+.0fm", (double)disp_corr);
+        canvas_draw_str(canvas, 95, MENU_ROW_Y(2), cbuf);
+
+        /* Подсказка в режиме редактирования */
+        if(vario_data->menu_editing) {
+            canvas_set_font(canvas, FontSecondary);
+            canvas_draw_str(canvas, 4, 63, "^v:+-10m OK <Del >-Alt");
+        }
 
         furi_mutex_release(vario_data->mutex);
         return;
@@ -505,42 +600,56 @@ static void draw_callback(Canvas* canvas, void* ctx) {
 
     /* ── Основной экран ───────────────────────────────────────────────── */
     float vspeed = vario_data->varioS * 0.01f;
+    float alt_display = vario_data->altitude + vario_data->settings.alt_correction;
 
+    /* VBAR */
     draw_vbar(canvas, vspeed);
-
-    /* Левый край контентной зоны — после полосы и стрелки */
-    int cx = VBAR_X + VBAR_W + VBAR_W / 2 + 3;
 
     char buf[32];
 
-    /* Статусные иконки */
-    canvas_set_font(canvas, FontSecondary);
-    if(!vario_data->settings.sound_enabled)
-        canvas_draw_str(canvas, cx, 8, "MUTE");
-    if(vario_data->settings.logging_enabled)
-        canvas_draw_str(canvas, 105, 8, "LOG");
-
-    /* Высота */
+    /* ── Высота: x=14, y=0..14 ────────────────────────────────────────── *
+     * FontBigNumbers: высота ~15px, baseline = нижний край.
+     * Рисуем число с baseline=14, "m" сразу после числа той же строкой.
+     * "m" рисуем FontSecondary baseline=14.
+     *
+     * Для определения ширины числа используем canvas_string_width,
+     * но у нас нет этой функции без canvas — поэтому рисуем число,
+     * а "m" ставим через canvas_draw_str_aligned с AlignLeft после числа.
+     * Проще: рисуем число AlignLeft от x=15, "m" AlignLeft сразу после.
+     * Максимум "-10000" = 6 символов × ~11px = 66px + "m" 6px = 72px ≤ 113 OK.
+     */
     canvas_set_font(canvas, FontBigNumbers);
-    snprintf(buf, sizeof(buf), "%.0f", (double)vario_data->altitude);
-    canvas_draw_str_aligned(canvas, 70, 20, AlignCenter, AlignBottom, buf);
-    canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str_aligned(canvas, 70, 22, AlignCenter, AlignTop, "m");
+    snprintf(buf, sizeof(buf), "%.0f", (double)alt_display);
+    /* Выравниваем число по правому краю области высоты (x=113), baseline=14 */
+    canvas_draw_str_aligned(canvas, 113, 0, AlignRight, AlignTop, buf);
 
-    /* Вертикальная скорость */
-    canvas_set_font(canvas, FontPrimary);
+    /* "m" — FontSecondary сразу после числа, на той же baseline */
+    canvas_set_font(canvas, FontSecondary);
+    /* Рисуем "m" после числа: позиция ~x=116 (после 113 + небольшой отступ) */
+    canvas_draw_str(canvas, 115, 13, "m");
+
+
+
+    /* ── График: y=16..47 ─────────────────────────────────────────────── */
+    draw_graph(canvas);
+
+    /* ── Скорость: y=43..54 ───────────────────────────────────────────── */
+    canvas_set_font(canvas, FontSecondary);
     if(fabsf(vspeed) < 0.01f)
         snprintf(buf, sizeof(buf), "0.00 m/s");
     else
         snprintf(buf, sizeof(buf), "%+.2f m/s", (double)vspeed);
-    canvas_draw_str_aligned(canvas, 70, 38, AlignCenter, AlignTop, buf);
+    canvas_draw_str_aligned(canvas, 70, 56, AlignCenter, AlignBottom, buf);
 
-    /* Температура и давление */
+    /* ── Температура, MUTE и давление: y=57..63 ─────────────────────────
+     * Строка: [15] "18.5C"  [64 центр] "m"(если mute)  [127] "1013hPa" */
     canvas_set_font(canvas, FontSecondary);
     snprintf(buf, sizeof(buf), "%.1fC", (double)vario_data->temperature);
-    canvas_draw_str(canvas, cx, 56, buf);
+    canvas_draw_str(canvas, 15, 63, buf);
+    if(!vario_data->settings.sound_enabled)
+        canvas_draw_str_aligned(canvas, 64, 63, AlignCenter, AlignBottom, "m");
     snprintf(buf, sizeof(buf), "%.0fhPa", (double)(vario_data->pressure / 100.0f));
-    canvas_draw_str_aligned(canvas, 126, 56, AlignRight, AlignTop, buf);
+    canvas_draw_str_aligned(canvas, 127, 63, AlignRight, AlignBottom, buf);
 
     furi_mutex_release(vario_data->mutex);
 }
@@ -557,19 +666,24 @@ static void handle_input(InputEvent* event, void* context) {
 static int32_t vario_worker(void* context) {
     UNUSED(context);
 
-    /* Сбрасываем статические переменные звука на случай повторного запуска */
     sound_speaker_owned = false;
     sound_next_beep     = 0;
     sound_beep_end      = 0;
 
     vario_data->settings.sound_enabled    = true;
     vario_data->settings.backlight_forced = false;
-    vario_data->settings.logging_enabled  = false;
-    vario_data->settings.log_interval     = 10;
-    vario_data->last_log_time             = 0;
+    vario_data->settings.alt_correction   = 0.0f;
     vario_data->last_button_time          = furi_get_tick();
     vario_data->menu_selection            = 0;
+    vario_data->menu_editing              = false;
+    vario_data->alt_edit_value            = 0.0f;
     vario_data->varioS                    = 0.0f;
+    vario_data->graph_last_ms             = furi_get_tick();
+    vario_data->graph_has_data            = false;
+    memset(vario_data->graph, 0, sizeof(vario_data->graph));
+
+    /* Очищаем лог и запоминаем время старта */
+    log_init();
 
     FURI_LOG_I(TAG, "Worker started, init BME280...");
 
@@ -588,6 +702,7 @@ static int32_t vario_worker(void* context) {
     while(vario_data->running) {
         if(vario_data->sensor_ready) {
             update_pressure();
+            graph_update();
             sound_update();
             log_to_file();
         } else {
@@ -604,8 +719,6 @@ static int32_t vario_worker(void* context) {
         furi_delay_ms(200);
     }
 
-    /* Гарантированно останавливаем динамик перед выходом.
-     * Используем acquire с таймаутом чтобы точно получить доступ. */
     if(sound_speaker_owned) {
         furi_hal_speaker_stop();
         furi_hal_speaker_release();
@@ -662,53 +775,89 @@ int32_t vario_app(void* p) {
 
             if(event.type == InputTypeShort) {
                 if(vario_data->show_menu) {
-                    switch(event.key) {
-                    case InputKeyUp:
-                        vario_data->menu_selection = (vario_data->menu_selection + 3u) % 4u;
-                        break;
-                    case InputKeyDown:
-                        vario_data->menu_selection = (vario_data->menu_selection + 1u) % 4u;
-                        break;
-                    case InputKeyOk:
-                        switch(vario_data->menu_selection) {
-                        case 0:
-                            vario_data->settings.sound_enabled =
-                                !vario_data->settings.sound_enabled;
+                    if(vario_data->menu_editing) {
+                        /* Режим редактирования alt_correction:
+                         *   Up/Down  — ±10 м
+                         *   Left (<) — отмена: вернуть предыдущее значение
+                         *   Right(>) — обнулить высоту: correction = -altitude
+                         *   OK       — применить и выйти
+                         *   Back     — отмена: вернуть предыдущее значение */
+                        switch(event.key) {
+                        case InputKeyUp:
+                            vario_data->alt_edit_value += 10.0f;
                             break;
-                        case 1:
-                            vario_data->settings.backlight_forced =
-                                !vario_data->settings.backlight_forced;
+                        case InputKeyDown:
+                            vario_data->alt_edit_value -= 10.0f;
                             break;
-                        case 2:
-                            vario_data->settings.logging_enabled =
-                                !vario_data->settings.logging_enabled;
+                        case InputKeyLeft:
+                            /* Отмена — возврат к сохранённому значению */
+                            vario_data->alt_edit_value =
+                                vario_data->settings.alt_correction;
+                            vario_data->menu_editing = false;
                             break;
-                        case 3:
-                            if(vario_data->settings.log_interval == 1u)
-                                vario_data->settings.log_interval = 2u;
-                            else if(vario_data->settings.log_interval == 2u)
-                                vario_data->settings.log_interval = 5u;
-                            else if(vario_data->settings.log_interval == 5u)
-                                vario_data->settings.log_interval = 10u;
-                            else if(vario_data->settings.log_interval == 10u)
-                                vario_data->settings.log_interval = 30u;
-                            else if(vario_data->settings.log_interval == 30u)
-                                vario_data->settings.log_interval = 60u;
-                            else
-                                vario_data->settings.log_interval = 1u;
+                        case InputKeyRight:
+                            /* Обнулить высоту: correction = -current_altitude,
+                             * чтобы altitude + correction = 0 */
+                            vario_data->alt_edit_value = -vario_data->altitude;
+                            vario_data->settings.alt_correction =
+                                vario_data->alt_edit_value;
+                            vario_data->menu_editing = false;
+                            break;
+                        case InputKeyOk:
+                            /* Применяем поправку и выходим */
+                            vario_data->settings.alt_correction =
+                                vario_data->alt_edit_value;
+                            vario_data->menu_editing = false;
+                            break;
+                        case InputKeyBack:
+                            /* Отмена — возврат к сохранённому значению */
+                            vario_data->alt_edit_value =
+                                vario_data->settings.alt_correction;
+                            vario_data->menu_editing = false;
                             break;
                         default:
                             break;
                         }
-                        break;
-                    case InputKeyBack:
-                        /* Back в меню = закрыть меню, не выходить */
-                        vario_data->show_menu = false;
-                        break;
-                    default:
-                        break;
+                    } else {
+                        /* Обычная навигация по меню */
+                        switch(event.key) {
+                        case InputKeyUp:
+                            vario_data->menu_selection =
+                                (vario_data->menu_selection + (MENU_COUNT-1u)) % MENU_COUNT;
+                            break;
+                        case InputKeyDown:
+                            vario_data->menu_selection =
+                                (vario_data->menu_selection + 1u) % MENU_COUNT;
+                            break;
+                        case InputKeyOk:
+                            switch(vario_data->menu_selection) {
+                            case 0:
+                                vario_data->settings.sound_enabled =
+                                    !vario_data->settings.sound_enabled;
+                                break;
+                            case 1:
+                                vario_data->settings.backlight_forced =
+                                    !vario_data->settings.backlight_forced;
+                                break;
+                            case 2:
+                                /* Входим в режим редактирования высоты */
+                                vario_data->alt_edit_value =
+                                    vario_data->settings.alt_correction;
+                                vario_data->menu_editing = true;
+                                break;
+                            default:
+                                break;
+                            }
+                            break;
+                        case InputKeyBack:
+                            vario_data->show_menu = false;
+                            break;
+                        default:
+                            break;
+                        }
                     }
                 } else {
+                    /* Основной экран */
                     switch(event.key) {
                     case InputKeyUp:
                         vario_data->settings.sound_enabled =
@@ -721,6 +870,7 @@ int32_t vario_app(void* p) {
                     case InputKeyOk:
                         vario_data->show_menu      = true;
                         vario_data->menu_selection = 0;
+                        vario_data->menu_editing   = false;
                         break;
                     default:
                         break;
@@ -735,10 +885,7 @@ int32_t vario_app(void* p) {
         view_port_update(view_port);
     }
 
-    /* ── Завершение ───────────────────────────────────────────────────── */
     vario_data->running = false;
-
-    /* Ждём воркера — он сам остановит динамик в конце своего цикла */
     furi_thread_join(worker);
     furi_thread_free(worker);
 
